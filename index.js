@@ -1358,6 +1358,8 @@ const aiHealth = new Map();
 // actual entry point is the default export below, which never calls this.
 // Exists purely so tests can isolate scenarios from each other without
 // waiting out real cooldown timers (see tests/ai-reliability.test.mjs).
+export { computeProgressSeries, redactForPupil, attentionReasons, computeAnalyticsExtras };
+
 export function __resetAiHealthForTests() {
   aiHealth.clear();
 }
@@ -2654,6 +2656,10 @@ function rowToSubmission(row) {
     retryOf: row.retry_of || null,
     leaderboardCounted: !!row.leaderboard_counted,
     createdAt: row.created_at,
+    // v7.9 (columns exist only after migrations/v7_9.sql; absent -> null)
+    teacherComment: row.teacher_comment ? { text: row.teacher_comment, by: row.comment_by || "", at: row.comment_at || null } : null,
+    reviewedAt: row.reviewed_at || null,
+    reviewedBy: row.reviewed_by || null,
   };
 }
 
@@ -2686,9 +2692,14 @@ function stripCoachUsedForPupil(submission) {
 // and the pupil's own /remark response. Pre-v7.5 (3-round) submissions are
 // redacted the same way.
 function redactForPupil(submission, isOwner) {
-  const base = stripCoachUsedForPupil(submission);
+  const stripped = stripCoachUsedForPupil(submission);
+  // v7.9: the review tick is a teacher's private to-do marker. The teacher's note
+  // to a pupil is the pupil's OWN to read (text + date, not who wrote it); a
+  // classmate never gets it.
+  const { teacherComment, reviewedAt, reviewedBy, ...base } = stripped;
   return {
     ...base,
+    ...(isOwner && teacherComment ? { teacherComment: { text: teacherComment.text, at: teacherComment.at } } : {}),
     rounds: base.rounds.map((r) => {
       // Teacher-only in every case: who adjusted a score, when, and what it was before.
       const { originalScore, overriddenBy, overriddenAt, ...own } = r;
@@ -2772,6 +2783,308 @@ function computeAnalytics(rows) {
       .map((c) => ({ pupilClass: c.pupilClass, n: c.n, avgFinal: Math.round((c.sum / c.n) * 10) / 10 }))
       .sort((a, b) => a.pupilClass.localeCompare(b.pupilClass)),
   };
+}
+
+// v7.8 - one pupil's progress over time, from their own stored rows. Shared by
+// the pupil's My Progress tab (GET /api/pupil/progress) and, in v7.9, the
+// teacher's pupil report. Takes D1 rows in ANY order and returns them oldest
+// first. Handles both shapes of `rounds` (v7.5+ two tagged units, and older
+// untagged 3-round entries) by only ever dividing by what is actually there.
+// Percentages (not raw marks) are used for the aggregate because the maximum
+// for a criterion differs between old and v7.5+ attempts.
+function computeProgressSeries(rows) {
+  const entries = [];
+  for (const row of rows || []) {
+    let rounds;
+    try {
+      rounds = JSON.parse(row.rounds || "[]");
+    } catch (e) {
+      continue;
+    }
+    if (!Array.isArray(rounds)) continue;
+    const criteria = [];
+    const units = [];
+    for (const r of rounds) {
+      if (!r) continue;
+      units.push({ score: Number.isFinite(r.score) ? r.score : 0, max: Number.isFinite(r.max) ? r.max : 0 });
+      for (const b of r.breakdown || []) {
+        if (!b || typeof b.part !== "string") continue;
+        criteria.push({ part: b.part, points: Number(b.points) || 0, max: Number(b.max) || 0 });
+      }
+    }
+    entries.push({
+      id: row.id,
+      createdAt: row.created_at,
+      topicId: row.topic_id,
+      topicTitle: row.topic_title,
+      finalScore: row.final_score,
+      maxScore: row.max_score,
+      practice: !!row.practice,
+      retryOf: row.retry_of || null,
+      units,
+      criteria,
+    });
+  }
+  entries.sort((a, b) => a.createdAt - b.createdAt);
+
+  // Personal best: highest score as a share of its maximum (non-practice first,
+  // practice only counts if there is nothing else).
+  const pct = (e) => (e.maxScore > 0 ? e.finalScore / e.maxScore : 0);
+  const real = entries.filter((e) => !e.practice);
+  const bestPool = real.length ? real : entries;
+  let best = null;
+  for (const e of bestPool) if (!best || pct(e) > pct(best)) best = e;
+
+  // Strongest / weakest criteria across every attempt (percentage of marks).
+  const agg = {};
+  for (const e of entries) {
+    for (const c of e.criteria) {
+      if (!(c.max > 0)) continue;
+      if (!agg[c.part]) agg[c.part] = { part: c.part, points: 0, max: 0, n: 0 };
+      agg[c.part].points += c.points;
+      agg[c.part].max += c.max;
+      agg[c.part].n++;
+    }
+  }
+  const crit = Object.values(agg).map((c) => ({ part: c.part, pct: Math.round((c.points / c.max) * 100), n: c.n }));
+  crit.sort((a, b) => b.pct - a.pct);
+  const strongest = crit.length ? crit[0] : null;
+  const weakest = crit.length > 1 ? crit[crit.length - 1] : null;
+
+  // Most improved: the largest gain, as a share of the maximum, between two
+  // attempts at the SAME topic (a later attempt vs an earlier one).
+  let mostImproved = null;
+  const byTopic = {};
+  for (const e of entries) {
+    const k = String(e.topicId || e.topicTitle || "");
+    (byTopic[k] = byTopic[k] || []).push(e);
+  }
+  for (const list of Object.values(byTopic)) {
+    for (let j = 1; j < list.length; j++) {
+      for (let i = 0; i < j; i++) {
+        const gain = pct(list[j]) - pct(list[i]);
+        if (gain > 0 && (!mostImproved || gain > mostImproved.gainPct / 100)) {
+          mostImproved = {
+            topicTitle: list[j].topicTitle,
+            from: list[i].finalScore,
+            to: list[j].finalScore,
+            max: list[j].maxScore,
+            gain: Math.round((list[j].finalScore - list[i].finalScore) * 10) / 10,
+            gainPct: Math.round(gain * 100),
+          };
+        }
+      }
+    }
+  }
+  return {
+    entries,
+    summary: {
+      attempts: entries.length,
+      best: best ? { id: best.id, topicTitle: best.topicTitle, finalScore: best.finalScore, maxScore: best.maxScore, practice: best.practice } : null,
+      strongest,
+      weakest,
+      criteria: crit,
+      mostImproved,
+    },
+  };
+}
+
+// ====================================================================
+// v7.9 - TEACHER END helpers
+// ====================================================================
+const V79_MIGRATION_MESSAGE =
+  "This feature needs the v7.9 database update (one small SQL file). In Cloudflare open Workers & Pages > D1 > your database > Console, paste in the contents of migrations/v7_9.sql, run it, then try again.";
+
+// The new columns only exist after migrations/v7_9.sql has been run. Every v7.9
+// feature that touches them asks here first, so a Worker deployed BEFORE the
+// migration keeps working (and says what to do) instead of crashing. A positive
+// answer is remembered; a negative one is re-checked after 20 seconds, so running
+// the migration takes effect without a redeploy.
+const v79Probe = new WeakMap();
+async function hasV79Columns(env, kind) {
+  const sql = kind === "topics" ? "SELECT sort_order FROM topics LIMIT 1" : "SELECT teacher_comment, reviewed_at FROM submissions LIMIT 1";
+  let slot = v79Probe.get(env.CCv6_DB);
+  if (!slot) {
+    slot = {};
+    v79Probe.set(env.CCv6_DB, slot);
+  }
+  const cached = slot[kind];
+  if (cached && (cached.ok || Date.now() - cached.at < 20000)) return cached.ok;
+  let ok = true;
+  try {
+    await env.CCv6_DB.prepare(sql).first();
+  } catch (e) {
+    ok = false;
+  }
+  slot[kind] = { ok, at: Date.now() };
+  return ok;
+}
+
+// ---- thresholds shared by the Needs-attention queue and the dashboard alerts ----
+const DEFAULT_ALERT_SETTINGS = { lowScore: 10, fallbackCount: 3, noAiHours: 24 };
+function sanitizeAlertSettings(raw) {
+  const r = raw && typeof raw === "object" ? raw : {};
+  const num = (v, lo, hi, d) => {
+    const n = Number(v);
+    return Number.isFinite(n) ? Math.min(hi, Math.max(lo, Math.round(n))) : d;
+  };
+  return {
+    lowScore: num(r.lowScore, 0, 25, DEFAULT_ALERT_SETTINGS.lowScore),
+    fallbackCount: num(r.fallbackCount, 1, 10, DEFAULT_ALERT_SETTINGS.fallbackCount),
+    noAiHours: num(r.noAiHours, 1, 168, DEFAULT_ALERT_SETTINGS.noAiHours),
+  };
+}
+async function getAlertSettings(env) {
+  const stored = await getConfig(env, "alert_settings");
+  let parsed = null;
+  try {
+    parsed = stored ? JSON.parse(stored) : null;
+  } catch (e) {
+    parsed = null;
+  }
+  return sanitizeAlertSettings(parsed);
+}
+
+function roundMissingImproved(r) {
+  if (!r || r.markedBy === "fallback") return false; // an offline-marked round is reported as "offline", not as a missing rewrite
+  if (roundUnit(r) === UNIT_Q2Q3) {
+    if (Array.isArray(r.modelAnswers)) return r.modelAnswers.filter((x) => x && String(x).trim()).length < 2;
+    return !(r.modelAnswer && String(r.modelAnswer).trim());
+  }
+  return !(r.modelAnswer && String(r.modelAnswer).trim());
+}
+// Why a submission is on the Needs-attention list. [] = nothing to look at.
+function attentionReasons(sub, settings) {
+  const reasons = [];
+  const rounds = sub.rounds || [];
+  if (sub.gradingDegraded || rounds.some((r) => r && r.markedBy === "fallback")) reasons.push({ code: "offline", label: "Marked offline - needs an AI re-mark" });
+  if (sub.flagged) reasons.push({ code: "flagged", label: "Language was flagged" });
+  if (rounds.filter((r) => r && r.coachUsed).length >= 2) reasons.push({ code: "coach", label: "Coach used in 2 or more parts" });
+  if (Number.isFinite(sub.finalScore) && sub.finalScore < settings.lowScore) reasons.push({ code: "low", label: "Low score (" + sub.finalScore + " / " + sub.maxScore + ")" });
+  if (rounds.some(roundMissingImproved)) reasons.push({ code: "noimproved", label: "Improved answer missing" });
+  return reasons;
+}
+function submissionHasFallback(sub) {
+  return !!sub.gradingDegraded || (sub.rounds || []).some((r) => r && r.markedBy === "fallback");
+}
+
+// ---- teacher pupil report (B3) ----
+function buildPupilReport(rows, pupil) {
+  const series = computeProgressSeries(rows);
+  const byId = {};
+  for (const row of rows) byId[row.id] = row;
+  const attempts = series.entries.map((e) => ({
+    id: e.id,
+    createdAt: e.createdAt,
+    topicTitle: e.topicTitle,
+    finalScore: e.finalScore,
+    maxScore: e.maxScore,
+    practice: e.practice,
+    retryOf: e.retryOf,
+    units: e.units,
+    comment: byId[e.id] && byId[e.id].teacher_comment ? byId[e.id].teacher_comment : "",
+  }));
+  const retries = [];
+  for (const e of series.entries) {
+    if (!e.retryOf) continue;
+    const first = series.entries.find((x) => x.id === e.retryOf);
+    if (first) retries.push({ topicTitle: e.topicTitle, firstId: first.id, secondId: e.id, first: first.finalScore, second: e.finalScore, max: e.maxScore, gain: Math.round((e.finalScore - first.finalScore) * 10) / 10 });
+  }
+  const comments = attempts.filter((a) => a.comment).map((a) => ({ id: a.id, createdAt: a.createdAt, topicTitle: a.topicTitle, comment: a.comment }));
+  return { pupil, series, attempts, retries, comments, generatedAt: Date.now() };
+}
+
+// ---- analytics extras (B5): topic x criterion heatmap and weekly trend ----
+function weekStartUTC(ms) {
+  const d = new Date(ms);
+  const back = (d.getUTCDay() + 6) % 7; // Monday = 0
+  return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate() - back)).toISOString().slice(0, 10);
+}
+function computeAnalyticsExtras(rows) {
+  const topics = {};
+  const criteriaOrder = [];
+  const weeks = {};
+  for (const row of rows) {
+    let rounds;
+    try {
+      rounds = JSON.parse(row.rounds || "[]");
+    } catch (e) {
+      continue;
+    }
+    const title = row.topic_title || "(untitled)";
+    if (!topics[title]) topics[title] = { topic: title, n: 0, parts: {} };
+    topics[title].n++;
+    for (const r of rounds) {
+      for (const b of (r && r.breakdown) || []) {
+        if (!b || typeof b.part !== "string" || !(b.max > 0)) continue;
+        if (!criteriaOrder.includes(b.part)) criteriaOrder.push(b.part);
+        const p = topics[title].parts[b.part] || (topics[title].parts[b.part] = { points: 0, max: 0 });
+        p.points += Number(b.points) || 0;
+        p.max += b.max;
+      }
+    }
+    if (Number.isFinite(row.created_at)) {
+      const wk = weekStartUTC(row.created_at);
+      const w = weeks[wk] || (weeks[wk] = { weekStart: wk, n: 0, sumPct: 0 });
+      const max = row.max_score > 0 ? row.max_score : 25;
+      w.n++;
+      w.sumPct += ((row.final_score || 0) / max) * 100;
+    }
+  }
+  const topicList = Object.values(topics).sort((a, b) => b.n - a.n || a.topic.localeCompare(b.topic)).slice(0, 20);
+  return {
+    heatmap: {
+      criteria: criteriaOrder,
+      topics: topicList.map((t) => ({
+        topic: t.topic,
+        n: t.n,
+        cells: criteriaOrder.map((c) => (t.parts[c] && t.parts[c].max > 0 ? Math.round((t.parts[c].points / t.parts[c].max) * 100) : null)),
+      })),
+    },
+    weekly: Object.values(weeks).sort((a, b) => a.weekStart.localeCompare(b.weekStart)).map((w) => ({ weekStart: w.weekStart, n: w.n, avgPct: Math.round(w.sumPct / w.n) })),
+  };
+}
+function parseDateParam(v, endOfDay) {
+  if (v === null || v === undefined) return null;
+  const s = String(v).trim();
+  if (!s) return null;
+  if (/^\d{10,13}$/.test(s)) return Number(s);
+  const m = s.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (!m) return null;
+  const t = Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3]));
+  if (!Number.isFinite(t)) return null;
+  return endOfDay ? t + 86400000 - 1 : t;
+}
+
+// ---- coach-tip templates (B8) ----
+const COACH_TEMPLATE_KINDS = ["starters", "story", "lesson"];
+const BUILTIN_COACH_TEMPLATES = [
+  { id: "builtin-starters-1", builtin: true, name: "Story starters", kind: "starters", lines: ["Last week, I...", "One time when I was at school...", "I still remember the day when..."] },
+  { id: "builtin-story-1", builtin: true, name: "Tell it in order", kind: "story", lines: ["Say WHEN and WHERE it happened first.", "Name WHO was there with you.", "Tell what happened step by step.", "End with how it finished."] },
+  { id: "builtin-lesson-1", builtin: true, name: "What I learnt", kind: "lesson", lines: ["Say what you learnt from it.", "Say how you would act next time.", "Suggest one thing others could do."] },
+];
+function sanitizeCoachTemplates(raw) {
+  const list = Array.isArray(raw) ? raw : [];
+  const out = [];
+  for (const t of list.slice(0, 30)) {
+    if (!t || typeof t !== "object") continue;
+    const name = String(t.name || "").trim().slice(0, 60);
+    const kind = COACH_TEMPLATE_KINDS.includes(t.kind) ? t.kind : null;
+    const lines = (Array.isArray(t.lines) ? t.lines : []).map((l) => String(l || "").trim().slice(0, 200)).filter(Boolean).slice(0, 12);
+    if (!name || !kind || !lines.length) continue;
+    out.push({ id: typeof t.id === "string" && /^[\w-]{1,40}$/.test(t.id) && !t.id.startsWith("builtin-") ? t.id : uid(), name, kind, lines });
+  }
+  return out;
+}
+async function getCoachTemplates(env) {
+  const stored = await getConfig(env, "coach_templates");
+  let parsed = [];
+  try {
+    parsed = stored ? JSON.parse(stored) : [];
+  } catch (e) {
+    parsed = [];
+  }
+  return sanitizeCoachTemplates(parsed);
 }
 
 function buildSubmissionsFilter(session, url) {
@@ -3101,7 +3414,10 @@ export default {
 
       // ---------- TOPICS ----------
       if (pathname === "/api/topics" && request.method === "GET") {
-        const { results } = await env.CCv6_DB.prepare("SELECT * FROM topics ORDER BY created_at ASC, rowid ASC").all();
+        // v7.9: a teacher-set order (sort_order, from migrations/v7_9.sql) comes first; topics never
+        // reordered keep their original created-at order after it. Before the migration: the old order.
+        const ordered = (await hasV79Columns(env, "topics")) ? "SELECT * FROM topics ORDER BY sort_order IS NULL, sort_order ASC, created_at ASC, rowid ASC" : "SELECT * FROM topics ORDER BY created_at ASC, rowid ASC";
+        const { results } = await env.CCv6_DB.prepare(ordered).all();
         return json({ topics: results.map(rowToTopic) });
       }
 
@@ -3509,6 +3825,37 @@ export default {
         return json({ submissions, total, offset, limit, hasMore: offset + limit < total });
       }
 
+      // v7.8 - GET /api/pupil/progress: the pupil's OWN compact history (latest
+      // 100, oldest first) for the My Progress tab. Owner only: it is built from
+      // the session's own name + class and nothing in the URL can change that.
+      // Contains only the pupil's own marks (which they already see in v7.7); no
+      // coach flags, no override details.
+      if (pathname === "/api/pupil/progress" && request.method === "GET") {
+        const session = await getSession(request, env);
+        if (!session) return json({ error: "Please log in first." }, 401);
+        if (session.role !== "pupil") return json({ error: "Only pupils have a My Progress page." }, 403);
+        const { results } = await env.CCv6_DB
+          .prepare("SELECT * FROM submissions WHERE LOWER(pupil_name) = LOWER(?) AND LOWER(pupil_class) = LOWER(?) ORDER BY created_at DESC LIMIT 100")
+          .bind(session.name, session.pupilClass || "unassigned")
+          .all();
+        return json(computeProgressSeries(results || []));
+      }
+
+      // v7.8 - GET /api/submissions/:id: ONE of the pupil's own submissions (used
+      // to open a Try Again entry's first try from My Progress / My Submissions).
+      // Owner only: someone else's id gets the same 404 as an id that does not exist.
+      if (pathname.startsWith("/api/submissions/") && pathname.split("/").length === 4 && request.method === "GET" && pathname !== "/api/submissions/mine" && pathname !== "/api/submissions/leaderboard") {
+        const session = await getSession(request, env);
+        if (!session) return json({ error: "Please log in first." }, 401);
+        if (session.role !== "pupil") return json({ error: "Not authorised." }, 403);
+        const id = pathname.split("/")[3];
+        const row = await env.CCv6_DB.prepare("SELECT * FROM submissions WHERE id = ?").bind(id).first();
+        if (!row) return json({ error: "Submission not found." }, 404);
+        const sub = rowToSubmission(row);
+        if (!isOwnSubmission(session, sub)) return json({ error: "Submission not found." }, 404);
+        return json({ submission: redactForPupil(sub, true) });
+      }
+
       // POST /api/submissions/:id/remark { roundIndex } - re-run AI marking
       // for ONE question that fell back to offline scoring. Available to
       // the pupil who owns the submission, and to any teacher (respecting
@@ -3601,6 +3948,9 @@ export default {
             "unit2_score",
             "unit1_breakdown",
             "unit2_breakdown",
+            // v7.9
+            "teacherComment",
+            "reviewedAt",
           ]
             .map(csvEscape)
             .join(",")
@@ -3659,6 +4009,8 @@ export default {
               new Date(s.createdAt).toISOString(),
               ...roundCols,
               ...schemeCols,
+              s.teacherComment ? s.teacherComment.text : "",
+              s.reviewedAt ? new Date(s.reviewedAt).toISOString() : "",
             ]
               .map(csvEscape)
               .join(",")
@@ -3855,15 +4207,262 @@ export default {
       // across the (non-practice, fully AI-marked) submissions in scope. Scoped
       // teacher-admins only ever see their own classes (same filter as the
       // Submissions tab). Pure arithmetic on stored rounds - no AI call.
+      // ================= v7.9 TEACHER-END ROUTES =================
+      // POST /api/teacher/submissions/:id/comment { comment } - a short note the
+      // pupil sees on their own result (empty text removes it). Class-scoped.
+      if (pathname.startsWith("/api/teacher/submissions/") && pathname.endsWith("/comment") && request.method === "POST") {
+        if (!requireTeacher(session)) return json({ error: "Not authorised." }, 403);
+        const id = pathname.split("/")[4];
+        const row = await env.CCv6_DB.prepare("SELECT * FROM submissions WHERE id = ?").bind(id).first();
+        if (!row) return json({ error: "Submission not found." }, 404);
+        if (!classAllowed(session, row.pupil_class)) return json({ error: "Not authorised for this pupil's class." }, 403);
+        if (!(await hasV79Columns(env, "submissions"))) return json({ error: V79_MIGRATION_MESSAGE, needsMigration: true }, 409);
+        const body = await request.json().catch(() => ({}));
+        const text = typeof body.comment === "string" ? body.comment.trim() : "";
+        if (text.length > 600) return badRequest("Please keep the note to 600 characters or fewer.");
+        if (text) {
+          const at = Date.now();
+          await env.CCv6_DB.prepare("UPDATE submissions SET teacher_comment = ?, comment_by = ?, comment_at = ? WHERE id = ?").bind(text, session.name || "teacher", at, id).run();
+          return json({ ok: true, teacherComment: { text, by: session.name || "teacher", at } });
+        }
+        await env.CCv6_DB.prepare("UPDATE submissions SET teacher_comment = ?, comment_by = ?, comment_at = ? WHERE id = ?").bind(null, null, null, id).run();
+        return json({ ok: true, teacherComment: null });
+      }
+
+      // POST /api/teacher/submissions/:id/reviewed { reviewed: true|false } - the "I have looked at this" tick.
+      if (pathname.startsWith("/api/teacher/submissions/") && pathname.endsWith("/reviewed") && request.method === "POST") {
+        if (!requireTeacher(session)) return json({ error: "Not authorised." }, 403);
+        const id = pathname.split("/")[4];
+        const row = await env.CCv6_DB.prepare("SELECT * FROM submissions WHERE id = ?").bind(id).first();
+        if (!row) return json({ error: "Submission not found." }, 404);
+        if (!classAllowed(session, row.pupil_class)) return json({ error: "Not authorised for this pupil's class." }, 403);
+        if (!(await hasV79Columns(env, "submissions"))) return json({ error: V79_MIGRATION_MESSAGE, needsMigration: true }, 409);
+        const body = await request.json().catch(() => ({}));
+        const on = body.reviewed !== false;
+        const at = on ? Date.now() : null;
+        await env.CCv6_DB.prepare("UPDATE submissions SET reviewed_at = ?, reviewed_by = ? WHERE id = ?").bind(at, on ? session.name || "teacher" : null, id).run();
+        return json({ ok: true, reviewedAt: at, reviewedBy: on ? session.name || "teacher" : null });
+      }
+
+      // GET /api/teacher/submissions/:id/linked - the other half of a first try / second try pair.
+      if (pathname.startsWith("/api/teacher/submissions/") && pathname.endsWith("/linked") && request.method === "GET") {
+        if (!requireTeacher(session)) return json({ error: "Not authorised." }, 403);
+        const id = pathname.split("/")[4];
+        const row = await env.CCv6_DB.prepare("SELECT * FROM submissions WHERE id = ?").bind(id).first();
+        if (!row) return json({ error: "Submission not found." }, 404);
+        if (!classAllowed(session, row.pupil_class)) return json({ error: "Not authorised for this pupil's class." }, 403);
+        let other = null;
+        let relation = null;
+        if (row.retry_of) {
+          other = await env.CCv6_DB.prepare("SELECT * FROM submissions WHERE id = ?").bind(row.retry_of).first();
+          relation = "this-is-second";
+        } else {
+          other = await env.CCv6_DB.prepare("SELECT * FROM submissions WHERE retry_of = ?").bind(id).first();
+          relation = "this-is-first";
+        }
+        // never hand over a row that is not the same pupil in a class this teacher may see
+        if (other && (!classAllowed(session, other.pupil_class) || other.pupil_name !== row.pupil_name)) other = null;
+        return json({ relation: other ? relation : null, linked: other ? rowToSubmission(other) : null });
+      }
+
+      // GET /api/teacher/submissions/:id - one submission, for opening it from the Needs-attention list. Class-scoped.
+      if (pathname.startsWith("/api/teacher/submissions/") && pathname.split("/").length === 5 && request.method === "GET" && !pathname.endsWith("/linked")) {
+        if (!requireTeacher(session)) return json({ error: "Not authorised." }, 403);
+        const id = pathname.split("/")[4];
+        const row = await env.CCv6_DB.prepare("SELECT * FROM submissions WHERE id = ?").bind(id).first();
+        if (!row) return json({ error: "Submission not found." }, 404);
+        if (!classAllowed(session, row.pupil_class)) return json({ error: "Not authorised for this pupil's class." }, 403);
+        return json({ submission: rowToSubmission(row) });
+      }
+
+      // GET /api/teacher/attention?class=&topic= - the Needs-attention queue (B1).
+      if (pathname === "/api/teacher/attention" && request.method === "GET") {
+        if (!requireTeacher(session)) return json({ error: "Not authorised." }, 403);
+        const settings = await getAlertSettings(env);
+        const { whereSql, params } = buildSubmissionsFilter(session, url);
+        const w = (whereSql ? whereSql + " AND " : "WHERE ") + "practice = 0";
+        const { results } = await env.CCv6_DB.prepare(`SELECT * FROM submissions ${w} ORDER BY created_at DESC LIMIT 300`).bind(...params).all();
+        const items = [];
+        for (const row of results || []) {
+          if (row.reviewed_at) continue;
+          const sub = rowToSubmission(row);
+          const reasons = attentionReasons(sub, settings);
+          if (reasons.length) items.push({ id: sub.id, pupilName: sub.pupilName, pupilClass: sub.pupilClass, topicTitle: sub.topicTitle, finalScore: sub.finalScore, maxScore: sub.maxScore, createdAt: sub.createdAt, retryOf: sub.retryOf, reasons });
+        }
+        items.sort((a, b) => b.reasons.length - a.reasons.length || b.createdAt - a.createdAt);
+        return json({ items: items.slice(0, 100), total: items.length, scanned: (results || []).length, settings, reviewTracking: await hasV79Columns(env, "submissions") });
+      }
+
+      // POST /api/teacher/attention/bulk { ids, action } - action: remark | retry-improved | archive | reviewed.
+      // AI actions take at most 10 ids per request (the page sends them one at a time and shows progress).
+      if (pathname === "/api/teacher/attention/bulk" && request.method === "POST") {
+        if (!requireTeacher(session)) return json({ error: "Not authorised." }, 403);
+        const body = await request.json().catch(() => ({}));
+        const action = String(body.action || "");
+        if (!["remark", "retry-improved", "archive", "reviewed"].includes(action)) return badRequest("Unknown action.");
+        const ids = Array.isArray(body.ids) ? [...new Set(body.ids.filter((x) => typeof x === "string" && x))] : [];
+        if (!ids.length) return badRequest("Choose at least one submission.");
+        const ai = action === "remark" || action === "retry-improved";
+        if (ids.length > (ai ? 10 : 100)) return badRequest(ai ? "AI actions take at most 10 submissions at a time." : "At most 100 submissions at a time.");
+        if (action === "reviewed" && !(await hasV79Columns(env, "submissions"))) return json({ error: V79_MIGRATION_MESSAGE, needsMigration: true }, 409);
+        const results = [];
+        for (const id of ids) {
+          let row = await env.CCv6_DB.prepare("SELECT * FROM submissions WHERE id = ?").bind(id).first();
+          if (!row) { results.push({ id, ok: false, message: "Not found." }); continue; }
+          if (!classAllowed(session, row.pupil_class)) { results.push({ id, ok: false, message: "Not one of your classes." }); continue; }
+          try {
+            if (action === "archive") {
+              await env.CCv6_DB.prepare("UPDATE submissions SET archived = ? WHERE id = ?").bind(1, id).run();
+              results.push({ id, ok: true, message: "Archived." });
+            } else if (action === "reviewed") {
+              await env.CCv6_DB.prepare("UPDATE submissions SET reviewed_at = ?, reviewed_by = ? WHERE id = ?").bind(Date.now(), session.name || "teacher", id).run();
+              results.push({ id, ok: true, message: "Marked as reviewed." });
+            } else {
+              let changed = 0, tried = 0, last = "";
+              const count = JSON.parse(row.rounds || "[]").length;
+              for (let i = 0; i < count; i++) {
+                const rounds = JSON.parse(row.rounds || "[]");
+                const r = rounds[i];
+                const needs = action === "remark" ? r && r.markedBy === "fallback" : roundMissingImproved(r);
+                if (!needs) continue;
+                tried++;
+                const res = action === "remark" ? await remarkSubmissionRound(env, row, i) : await retryRoundModelAnswers(env, row, i);
+                if (res && res.ok && res.success) changed++;
+                else last = (res && (res.message || res.error)) || "The AI is not available right now.";
+                row = (await env.CCv6_DB.prepare("SELECT * FROM submissions WHERE id = ?").bind(id).first()) || row;
+              }
+              if (!tried) results.push({ id, ok: true, message: "Nothing needed doing." });
+              else if (changed === tried) results.push({ id, ok: true, message: action === "remark" ? "Re-marked by AI." : "Improved answer added." });
+              else results.push({ id, ok: false, message: (changed ? "Partly done. " : "") + last });
+            }
+          } catch (e) {
+            results.push({ id, ok: false, message: "Something went wrong: " + (e && e.message ? e.message : String(e)) });
+          }
+        }
+        return json({ ok: true, results, done: results.filter((r) => r.ok).length, failed: results.filter((r) => !r.ok).length });
+      }
+
+      // GET /api/teacher/pupil-progress?name=&class= - one pupil's report (B3): the same
+      // series the pupil sees, plus retries and teacher comments. Class-scoped.
+      if (pathname === "/api/teacher/pupil-progress" && request.method === "GET") {
+        if (!requireTeacher(session)) return json({ error: "Not authorised." }, 403);
+        const name = (url.searchParams.get("name") || "").trim();
+        const pupilClass = (url.searchParams.get("class") || "unassigned").trim();
+        if (!name) return badRequest("Missing pupil name.");
+        if (!classAllowed(session, pupilClass)) return json({ error: "Not authorised for this pupil's class." }, 403);
+        const { results } = await env.CCv6_DB.prepare("SELECT * FROM submissions WHERE pupil_name = ? AND pupil_class = ? ORDER BY created_at DESC LIMIT 200").bind(name, pupilClass).all();
+        return json(buildPupilReport(results || [], { name, pupilClass }));
+      }
+
+      // GET /api/teacher/alerts - dashboard banner + AI provider usage (B6). Scoped like everything else.
+      if (pathname === "/api/teacher/alerts" && request.method === "GET") {
+        if (!requireTeacher(session)) return json({ error: "Not authorised." }, 403);
+        const settings = await getAlertSettings(env);
+        const { whereSql, params } = buildSubmissionsFilter(session, new URL("https://x.invalid/"));
+        const w = (whereSql ? whereSql + " AND " : "WHERE ") + "practice = 0";
+        const { results } = await env.CCv6_DB.prepare(`SELECT * FROM submissions ${w} ORDER BY created_at DESC LIMIT 300`).bind(...params).all();
+        const subs = (results || []).map((r) => rowToSubmission(r));
+        const now = Date.now();
+        const alerts = [];
+        const last10 = subs.slice(0, 10);
+        const fallbackCount = last10.filter(submissionHasFallback).length;
+        if (last10.length >= settings.fallbackCount && fallbackCount >= settings.fallbackCount) {
+          alerts.push({ code: "fallback", level: "warn", message: fallbackCount + " of the last " + last10.length + " submissions were marked offline instead of by AI. The AI may be down or out of quota - check the AI status in Settings." });
+        }
+        const windowRows = subs.filter((s) => now - s.createdAt <= settings.noAiHours * 3600000);
+        if (windowRows.length > 0 && windowRows.every(submissionHasFallback)) {
+          alerts.push({ code: "no-ai", level: "warn", message: "None of the " + windowRows.length + " submissions in the last " + settings.noAiHours + " hours were marked by AI." });
+        }
+        const usage = (ms) => {
+          const counts = {};
+          for (const s of subs) {
+            if (now - s.createdAt > ms) continue;
+            for (const r of s.rounds || []) {
+              const k = (r && r.markedBy) || "unknown";
+              counts[k] = (counts[k] || 0) + 1;
+            }
+          }
+          return counts;
+        };
+        const attentionCount = subs.filter((s) => !s.reviewedAt && attentionReasons(s, settings).length).length;
+        return json({ alerts, providers: { day: usage(86400000), week: usage(7 * 86400000) }, attentionCount, settings });
+      }
+
+      if (pathname === "/api/teacher/alert-settings" && request.method === "GET") {
+        if (!requireTeacher(session)) return json({ error: "Not authorised." }, 403);
+        return json({ settings: await getAlertSettings(env), defaults: DEFAULT_ALERT_SETTINGS });
+      }
+      if (pathname === "/api/teacher/alert-settings" && request.method === "POST") {
+        if (!requireSuperAdmin(session)) return json({ error: "Not authorised." }, 403);
+        const body = await request.json().catch(() => ({}));
+        const settings = sanitizeAlertSettings(body.settings || body);
+        await setConfig(env, "alert_settings", JSON.stringify(settings));
+        return json({ ok: true, settings });
+      }
+
+      // Coach-tip templates (B8): saved starter lines a teacher can drop into a topic's coach tips.
+      if (pathname === "/api/teacher/coach-templates" && request.method === "GET") {
+        if (!requireTeacher(session)) return json({ error: "Not authorised." }, 403);
+        return json({ templates: await getCoachTemplates(env), builtin: BUILTIN_COACH_TEMPLATES });
+      }
+      if (pathname === "/api/teacher/coach-templates" && request.method === "POST") {
+        if (!requireSuperAdmin(session)) return json({ error: "Not authorised." }, 403);
+        const body = await request.json().catch(() => ({}));
+        const templates = sanitizeCoachTemplates(body.templates);
+        await setConfig(env, "coach_templates", JSON.stringify(templates));
+        return json({ ok: true, templates });
+      }
+
+      // Topic tools (B8): duplicate and reorder (super admin, like all topic editing).
+      if (pathname.startsWith("/api/teacher/topics/") && pathname.endsWith("/duplicate") && request.method === "POST") {
+        if (!requireSuperAdmin(session)) return json({ error: "Not authorised." }, 403);
+        const id = pathname.split("/")[4];
+        const src = await env.CCv6_DB.prepare("SELECT * FROM topics WHERE id = ?").bind(id).first();
+        if (!src) return json({ error: "Topic not found." }, 404);
+        const t = rowToTopic(src);
+        const copy = { ...t, id: uid(), title: (t.title + " (copy)").slice(0, 200) };
+        await env.CCv6_DB
+          .prepare(
+            `INSERT INTO topics (id, title, image_url, image_description, questions, tags, coach, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(id) DO UPDATE SET
+               title = excluded.title, image_url = excluded.image_url, image_description = excluded.image_description,
+               questions = excluded.questions, tags = excluded.tags, coach = excluded.coach`
+          )
+          .bind(copy.id, copy.title, copy.imageUrl, copy.imageDescription, JSON.stringify(copy.questions), JSON.stringify(copy.tags), JSON.stringify(copy.coach), Date.now())
+          .run();
+        return json({ topic: copy });
+      }
+      if (pathname === "/api/teacher/topics/reorder" && request.method === "POST") {
+        if (!requireSuperAdmin(session)) return json({ error: "Not authorised." }, 403);
+        if (!(await hasV79Columns(env, "topics"))) return json({ error: V79_MIGRATION_MESSAGE, needsMigration: true }, 409);
+        const body = await request.json().catch(() => ({}));
+        const ids = Array.isArray(body.ids) ? body.ids.filter((x) => typeof x === "string" && x) : [];
+        if (!ids.length) return badRequest("No topics to order.");
+        for (let i = 0; i < ids.length; i++) {
+          await env.CCv6_DB.prepare("UPDATE topics SET sort_order = ? WHERE id = ?").bind(i, ids[i]).run();
+        }
+        return json({ ok: true, count: ids.length });
+      }
+
       if (pathname === "/api/teacher/analytics" && request.method === "GET") {
         if (!requireTeacher(session)) return json({ error: "Not authorised." }, 403);
         const { whereSql, params } = buildSubmissionsFilter(session, url);
-        const w = (whereSql ? whereSql + " AND " : "WHERE ") + "practice = 0 AND grading_degraded = 0";
+        let w = (whereSql ? whereSql + " AND " : "WHERE ") + "practice = 0 AND grading_degraded = 0";
+        // v7.9: optional date range (from / to as YYYY-MM-DD or epoch ms) and a bigger window (2000, was 500)
+        const fromMs = parseDateParam(url.searchParams.get("from"), false);
+        const toMs = parseDateParam(url.searchParams.get("to"), true);
+        const bind = params.slice();
+        if (fromMs !== null) { w += " AND created_at >= ?"; bind.push(fromMs); }
+        if (toMs !== null) { w += " AND created_at <= ?"; bind.push(toMs); }
         const { results } = await env.CCv6_DB
-          .prepare(`SELECT pupil_class, topic_title, rounds, final_score FROM submissions ${w} ORDER BY created_at DESC LIMIT 500`)
-          .bind(...params)
+          .prepare(`SELECT pupil_class, topic_title, rounds, final_score, max_score, created_at FROM submissions ${w} ORDER BY created_at DESC LIMIT 2001`)
+          .bind(...bind)
           .all();
-        return json(computeAnalytics(results || []));
+        const all = results || [];
+        const capped = all.length > 2000;
+        const rows = capped ? all.slice(0, 2000) : all;
+        return json({ ...computeAnalytics(rows), ...computeAnalyticsExtras(rows), capped, window: 2000, range: { from: fromMs, to: toMs } });
       }
 
       // v7.5 - separate rubric for Unit 2 (Questions 2 + 3 marked together).

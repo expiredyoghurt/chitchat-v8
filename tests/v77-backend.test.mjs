@@ -31,7 +31,7 @@ function makeDb(initialConfig) {
       if (i >= 0) topics[i] = row; else topics.push(row);
       return {};
     }
-    if (/^SELECT pupil_class, topic_title, rounds, final_score FROM submissions/.test(s)) {
+    if (/^SELECT pupil_class, topic_title, rounds, final_score(, max_score, created_at)? FROM submissions/.test(s)) {
       let rows = submissions.filter((r) => r.practice === 0 && r.grading_degraded === 0 && r.archived === 0);
       if (/LOWER\(pupil_class\) IN/.test(s)) { rows = rows.filter((r) => params.map(String).includes(String(r.pupil_class).toLowerCase())); }
       else if (/LOWER\(pupil_class\) = LOWER\(\?\)/.test(s)) { rows = rows.filter((r) => String(r.pupil_class).toLowerCase() === String(params[0]).toLowerCase()); }

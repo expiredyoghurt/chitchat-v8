@@ -132,7 +132,9 @@ await tick();
 
 check("back on result screen", !!doc.querySelector('[data-action="play-again"]'));
 check("improvement panel shown", doc.body.innerHTML.includes("You improved by 1.3 points"), doc.body.innerHTML.includes("Second try") ? "panel present, wrong text" : "no panel");
-check("v7.5: per-question before->after scores are NOT shown to the pupil (overall average only)", !(doc.body.innerHTML.includes("12 &rarr; 18") || doc.body.innerHTML.includes("12 → 18")));
+// v7.8 (replaces the v7.5 "overall average only" assertion): v7.7 already shows a pupil their OWN marks, so the pupil's own
+// second-try result now carries a per-unit before -> after chip. (Classmates' entries still carry no marks; see v78 tests.)
+check("v7.8: the pupil's own result shows the per-unit before -> after chip", doc.body.innerHTML.includes("12 &rarr; 18") || doc.body.innerHTML.includes("12 → 18"));
 check("v7.5: no per-round 'was' score tag for the pupil", !doc.body.innerHTML.includes("(was 12)"));
 check("no second Try Again offered", !doc.querySelector('[data-action="start-retry"]'));
 check("second-try note shown", doc.body.innerHTML.includes("That was your second try"));

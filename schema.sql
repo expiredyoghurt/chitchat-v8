@@ -16,7 +16,8 @@ CREATE TABLE IF NOT EXISTS topics (
   questions          TEXT NOT NULL DEFAULT '[]',   -- JSON array of 3 question strings
   tags               TEXT NOT NULL DEFAULT '[]',   -- JSON array
   coach              TEXT NOT NULL DEFAULT '[]',   -- JSON array, one entry per question: {starters:[], resources:[{title,url,type}]}
-  created_at         INTEGER NOT NULL
+  created_at         INTEGER NOT NULL,
+  sort_order         INTEGER                       -- v7.9: teacher-set order (NULL = not reordered)
 );
 
 CREATE TABLE IF NOT EXISTS pupils (
@@ -64,6 +65,12 @@ CREATE TABLE IF NOT EXISTS submissions (
   -- marked/leaderboarded exactly like any other submission - this column
   -- only links it back to the attempt it revises.
   retry_of                   TEXT REFERENCES submissions(id),
+  -- v7.9 (existing databases get these from migrations/v7_9.sql)
+  teacher_comment            TEXT,
+  comment_by                 TEXT,
+  comment_at                 INTEGER,
+  reviewed_at                INTEGER,
+  reviewed_by                TEXT,
   -- v7.3: whether this submission has ever actually contributed to the
   -- pupils table (leaderboard) aggregate. Set once, at whichever moment a
   -- non-practice submission first has every one of its 3 questions AI-

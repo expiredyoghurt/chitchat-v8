@@ -5,6 +5,109 @@ built as a single Cloudflare Worker: one file serves the pupil-facing game,
 the leaderboard, and hidden teacher tools, backed by D1 (Cloudflare's SQLite
 database) with Workers KV used only for session tokens.
 
+## What's new in v7.9 — teacher end: attention queue, notes, reports, alerts
+
+**One database step.** Existing installs run `migrations/v7_9.sql` once (five new columns
+on `submissions`, one on `topics`); see BROWSER_DEPLOY_GUIDE.md. New installs use
+`schema.sql`, which already has them. You may deploy the Worker first: until the SQL is run,
+notes, "reviewed" ticks and topic reordering reply "needs the v7.9 database update" and
+everything else keeps working (the check re-runs every 20 seconds, no redeploy needed).
+
+- **Needs attention** (new tab, with a count): the newest 300 counted, non-archived
+  submissions that were marked offline, had language flagged, used the coach in 2+ parts,
+  scored below a line you set (default 10), or are missing an improved answer. Reviewed
+  ones drop out. Select several and **AI re-mark**, **Retry improved answers**,
+  **Mark reviewed** or **Archive**. AI actions are sent one submission per request with a
+  live "3 of 8 done" and a plain list of what failed. `GET /api/teacher/attention`,
+  `POST /api/teacher/attention/bulk` (AI actions max 10 ids, others max 100, all class-scoped).
+- **Note to the pupil + Reviewed tick**, on every submission's detail view (600 characters).
+  The pupil reads the note (text + date, not who wrote it) on their own result; the
+  server removes it, and the tick, from classmates' copies. Adds "teacherComment" and
+  "reviewedAt" columns to the CSV export.
+- **First try vs second try** for teachers: overall and per-unit change, per-criterion
+  change, and First | Second | Improved columns in each question's table. New
+  `GET /api/teacher/submissions/:id/linked` (and `/:id`, to open a submission from the queue).
+- **Pupil report** (Pupils > a pupil > *Progress report*): the same figures the pupil
+  sees plus second tries and your notes, with **Print / save as PDF** (print styles show only
+  the report). `GET /api/teacher/pupil-progress?name=&class=`.
+- **Insights**: From / To dates, a window of 2000 (was 500) that says when it was cut, a
+  topic x criterion heatmap (numbers always shown), a week-by-week trend, and CSV export of
+  the heatmap.
+- **Alerts**: a banner when 3+ of the last 10 submissions were marked offline, or nothing
+  in 24 hours was AI-marked; dismissible per visit. AI Health also shows which marker did
+  the last 24 hours / 7 days of work. Thresholds in Settings > Alerts (super admin).
+- **Settings** is split into Marking / AI models / Alerts / Coach templates / Account.
+  Nothing moved between sections except being tidied.
+- **Topic tools** (super admin): move up/down (`sort_order`), duplicate, read-only
+  **Preview as pupil** (shows the questions and what the coach would show), and
+  **coach-tip templates** you save once and insert into any question's starters, story
+  tips or lesson tips. Three built-in suggestions are included.
+
+**Test changes:** the two analytics fakes in `v76-backend` / `v77-backend` now accept the
+two extra columns the analytics query selects. New suites: `v79-backend`, `v79-frontend`.
+
+## What's new in v7.8 — player end: drafts, My Progress, second-try comparison
+
+No schema change and no migration: deploy the new `index.js` + `frontend.js`.
+
+**Drafts (this device only)**
+
+- What a pupil types is saved in the browser's `localStorage` about 0.8 seconds after
+  they pause. The key holds the pupil's name + class + topic + mode (+ the first try's id
+  for a second try), so **another pupil on the same computer never sees it**. It stores
+  every box (or the single box) and the practice tick.
+- Coming back to the same topic offers **Continue where you left off** or **Start fresh**.
+  Typing straight away counts as starting fresh. A quiet line says *Saved on this device*,
+  each answer shows a live word count, and *Not you? Log out* sits beside it.
+- The draft is removed when the answers are submitted, when the pupil logs out
+  (their own drafts only), and after 7 days. If the browser blocks storage the page works
+  exactly as before and says drafts are not saved.
+- **Side fix:** opening the coach, switching between branch / single box, or any other
+  redraw used to empty the answer boxes. Typed text now survives every redraw.
+
+**Progress tab (new)**
+
+- A new pupil tab, **Progress**, shows: personal best, strongest and weakest criterion in
+  plain words (as a percentage of marks, so older and v7.5+ attempts mix fairly), the most
+  improved topic (largest gain between two attempts at the same topic), a small score
+  line per topic (inline SVG, no chart library; a hollow dot is a practice attempt, so it
+  never relies on colour), and the 10 most recent attempts with a View button.
+- New owner-only endpoint `GET /api/pupil/progress` (latest 100, oldest first; teachers get
+  403). It carries only the pupil's own marks: no coach use, no override details.
+  The calculation is the reusable `computeProgressSeries(rows)` (v7.9 reuses it).
+- New owner-only `GET /api/submissions/:id`: someone else's id answers 404 exactly like an
+  id that does not exist. View uses it to open any of your own attempts.
+
+**Second-try comparison**
+
+- A second try's result (and a second try opened later from Submissions) shows
+  **First try | Second try | Improved response** (stacks on a phone) plus one score chip
+  per part, e.g. *Question 1: 12 → 18 (up 6)*. Chips only appear where marks exist, i.e.
+  the pupil's own entry. The overall before/after panel is unchanged.
+- On the Try Again screen every sentence of the improved answer has a **Use this
+  sentence** button. It appends that sentence to the Experience box (branch mode) or the
+  single box, in the right question's box, then it can be reworded.
+
+**What the improved answer added**
+
+- Client-side only (no extra AI call). A sentence of the improved answer is marked
+  (underlined + highlighted) when fewer than about 60% of its words appear in any one
+  sentence the pupil wrote, and fewer than 80% appear anywhere in their answer (that second
+  guard stops a rewrite that merely merges two of the pupil's sentences from lighting up).
+  Chips say what kind of detail was added: who, when, where, why, how it ended, what was
+  learnt, a suggestion (and something from the picture, for Question 1).
+- A **Show what's new** toggle (on by default) is remembered per device. Text is escaped
+  first and then wrapped, so nothing in an AI reply can inject HTML.
+- Known limit: a rewrite that rephrases everything still marks most sentences. The
+  chips are the useful part in that case; if it looks noisy, asking the AI for an
+  `added: []` list is a later option.
+
+**Test changes:** one old assertion in `tests/retry-frontend.test.mjs` said a pupil must
+*not* see per-question before → after scores. v7.7 already shows a pupil their own marks,
+and the comparison chips are requested in v7.8, so that line now checks the chip exists.
+New suites: `tests/v78-backend.test.mjs`, `tests/v78-frontend.test.mjs`; shared fake
+database in `tests/_fake.mjs`.
+
 ## What's new in v7.7 — pupils see their marks; improved answers beside their own
 
 No schema change and no migration: deploy the new `index.js` + `frontend.js`.

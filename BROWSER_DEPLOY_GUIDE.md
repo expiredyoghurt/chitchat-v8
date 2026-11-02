@@ -241,6 +241,23 @@ you expect to tweak the code again later (e.g. adding topics to
 
 ---
 
+## Updating an existing install to v7.9 (one small database step)
+
+v7.8 needs nothing but the new files. **v7.9 adds a few columns**, so once, after you
+upload the new files and Cloudflare has redeployed:
+
+1. In Cloudflare open **Workers & Pages > D1 > your database > Console**.
+2. Open `migrations/v7_9.sql` from this project, copy everything in it, paste it into
+   the console and press **Execute**. (It adds five columns to `submissions` and one to
+   `topics`. Run it only once; running it twice shows "duplicate column name", which is
+   harmless.)
+3. Refresh the teacher page. No redeploy is needed.
+
+You can deploy the files first and run the SQL later: until you do, teacher notes, the
+"reviewed" ticks and topic reordering say they need the database update, and everything
+else (including every pupil feature) keeps working. **A brand-new install** uses
+`schema.sql`, which already has the columns, so skip the migration there.
+
 ## After deploying (either path)
 
 Whichever path you used, from here the app behaves exactly as described in
